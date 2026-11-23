@@ -12,8 +12,8 @@ During complex multi-agent setups or hackathon sprints, operators should not bur
 | **`300,000 – 449,999 tokens`** | Warning Amber / Yellow | `#F59E0B` | **"1 mission left"** — finish the current mission and prepare a clean handoff. |
 | **`>= 450,000 tokens`** | Critical Red | `#EF4444` | **"Rotate thread now"** — switch to a fresh thread immediately before compaction or attention decay. |
 
-### Yellow Warning Tier (`309,729 tokens` — `#F59E0B`, 1 mission remaining)
-![HUD Yellow Warning Tier at 309,729 tokens](./assets/SCREENSHOT_HUD_YELLOW_309729_TOKENS.png)
+### Yellow Warning Tier (`325,762 tokens` — `#F59E0B`, 1 mission remaining)
+![HUD Yellow Warning Tier at 325,762 tokens](./assets/SCREENSHOT_HUD_YELLOW_325762_TOKENS.png)
 
 ### Red Critical Tier (`554,677 tokens` — `#EF4444`, switch thread immediately)
 ![HUD Red Critical Tier at 554,677 tokens](./assets/SCREENSHOT_HUD_RED_554677_TOKENS.png)
