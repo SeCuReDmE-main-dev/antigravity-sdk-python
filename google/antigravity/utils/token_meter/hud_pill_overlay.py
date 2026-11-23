@@ -51,6 +51,69 @@ TURBO_SHIELD_OFFSET = 144
 # Send disc left edge on rows y_btn+10/+12 -> equivalent box_right
 # (measured: 1302 -> 1334 with shield 1190; 1275 -> shield 1162; both = box_right - 144/145).
 SEND_LEFT_TO_BOX_RIGHT = 32
+ANCHOR_DEADZONE_PX = 2
+
+TOKEN_WARN_YELLOW_THRESHOLD = 300_000
+TOKEN_CRIT_RED_THRESHOLD = 450_000
+PILL_COLOR_CALM_GREY = "#8E8E8E"
+PILL_COLOR_WARN_YELLOW = "#F59E0B"
+PILL_COLOR_CRIT_RED = "#EF4444"
+
+
+def _resolve_pill_tier_color(
+    total_tokens: int,
+    *,
+    is_active_accent: bool = False,
+    accent_color: str = "#8423BF",
+) -> str:
+    """Return the deterministic color for both the indicator dot (`•`) and the token text.
+
+    Theme color #3 (`accent_color` / `is_active_accent`) is permanently banned from the pill so
+    typing never turns the dot purple. Color depends strictly on total displayed tokens:
+    - `< 300,000`        -> `#8E8E8E` (calm secondary grey, idle and typing alike)
+    - `300,000..449,999` -> `#F59E0B` (amber/yellow warning)
+    - `>= 450,000`       -> `#EF4444` (critical red)
+    """
+    _ = (is_active_accent, accent_color)
+    if total_tokens >= TOKEN_CRIT_RED_THRESHOLD:
+        return PILL_COLOR_CRIT_RED
+    if total_tokens >= TOKEN_WARN_YELLOW_THRESHOLD:
+        return PILL_COLOR_WARN_YELLOW
+    return PILL_COLOR_CALM_GREY
+
+
+def _is_dark_input_bar_surface(rgb: tuple[int, int, int]) -> bool:
+    """Return True when `rgb` at `y_safe` is Antigravity's dark input-bar surface.
+
+    Tolerates the blue/violet glow halo cast by Voice Mode (`B > R`, `B <= 115`) as well as
+    theme surface tints, while rejecting bright modals, white overlays, or light backdrops.
+    """
+    r, g, b = rgb
+    luma = 0.299 * r + 0.587 * g + 0.114 * b
+    if luma > 74.0 or min(r, g, b) < 12 or max(r, g, b) > 115:
+        return False
+    # Neutral dark grey (#141414 .. #3A3A3A)
+    if (max(r, g, b) - min(r, g, b)) <= 18 and max(r, g, b) <= 64:
+        return True
+    # Voice Mode blue/cyan/violet halo or dark theme accent tint on the input bar (blue-dominant or purple-tinted)
+    if b >= r and b >= g - 8 and r <= 68 and g <= 82 and b <= 115:
+        return True
+    return False
+
+
+def _apply_anchor_hysteresis(
+    candidate_x: int | None,
+    previous_x: int | None,
+    deadzone_px: int = ANCHOR_DEADZONE_PX,
+) -> int | None:
+    """Stabilize horizontal anchor coordinate with a deadzone (default 2 px) to prevent 1-2 px jitter."""
+    if candidate_x is None:
+        return previous_x
+    if previous_x is None:
+        return candidate_x
+    if abs(candidate_x - previous_x) <= deadzone_px:
+        return previous_x
+    return candidate_x
 
 _LAST_INSPECT_ERROR: str | None = None
 
@@ -381,37 +444,46 @@ def _inspect_live_antigravity_bar(
         if rm == 255 and gm == 255 and bm == 255:
             return (True, False, None, "#202020", None)
 
-        # Verify that the middle of the input bar at y_safe is dark grey (#181818 .. #2A2A2A)
-        if not (22 <= rm <= 46 and 22 <= gm <= 46 and 22 <= bm <= 46 and (max(rm, gm, bm) - min(rm, gm, bm)) <= 8):
-            # Input bar is not at the bottom (e.g. Settings modal or full-screen overlay covering it)
+        # Verify that the middle of the input bar at y_safe is dark (tolerating Voice Mode blue/violet glow halo)
+        if not _is_dark_input_bar_surface((rm, gm, bm)):
+            # Input bar is not at the bottom (e.g. bright Settings modal or light overlay covering it)
             return (False, False, None, "#202020", None)
 
         bar_surface_hex = f"#{rm:02X}{gm:02X}{bm:02X}"
 
-        # Scan horizontally from x = 56% of screen_w to the right edge at y_safe to find exact `box_right`
+        # Scan horizontally from x = 56% of screen_w to the right edge at y_safe to find exact `box_right`.
+        # In Voice Mode, the blue halo creates a gentle gradient across the bar, so we allow either close match
+        # to the center pixel OR a smooth local step (<= 4 per 6px step) while staying on the dark bar surface.
         start_x = int(round(screen_w * 0.56))
         box_right = start_x
+        prev_r, prev_g, prev_b = rm, gm, bm
         for x in range(start_x, screen_w - 8, 6):
             r, g, b = px(x, y_safe)
-            if abs(r - rm) <= 6 and abs(g - gm) <= 6 and abs(b - bm) <= 6:
+            close_to_center = abs(r - rm) <= 10 and abs(g - gm) <= 10 and abs(b - bm) <= 14
+            smooth_halo_step = (
+                _is_dark_input_bar_surface((r, g, b))
+                and abs(r - prev_r) <= 4
+                and abs(g - prev_g) <= 4
+                and abs(b - prev_b) <= 5
+                and (r + g + b) >= 54  # reject outer #101010 background outside the input box
+            )
+            if close_to_center or smooth_halo_step:
                 box_right = x
+                prev_r, prev_g, prev_b = r, g, b
             elif x > start_x + 40:
-                # Check 12px ahead in case of a tiny artifact; if also dark #101010, we hit the right border!
+                # Check 12px ahead in case of a tiny artifact; if also outside the bar surface, we hit the right border!
                 r2, g2, b2 = px(min(screen_w - 4, x + 12), y_safe)
-                if abs(r2 - rm) > 6:
+                if abs(r2 - rm) > 10 or abs(b2 - bm) > 14:
                     break
         # Refine box_right to 1px accuracy
         for x in range(box_right, min(screen_w - 4, box_right + 8)):
             r, g, b = px(x, y_safe)
-            if abs(r - rm) <= 6 and abs(g - gm) <= 6 and abs(b - bm) <= 6:
+            if abs(r - prev_r) <= 6 and abs(g - prev_g) <= 6 and abs(b - prev_b) <= 8 and (r + g + b) >= 54:
                 box_right = x
             else:
                 break
 
-        # Re-anchor on the Send disc itself (bright/accent run >= 20 px). The y_safe border scan can
-        # overshoot (e.g. Fill: outside colour within +-6 of the surface -> box_right 1355 at the
-        # screen edge), which pushed the pill onto Turbo. Measured: send_left 1300 -> box_right 1334,
-        # send_left 1273 -> shield 1162 (same 111 px), so box_right := send_left + 34.
+        # Re-anchor on the Send disc when present (bright/accent run >= 18 px on rows y_btn+10/+12).
         send = _find_send_button(
             px,
             x_from=min(screen_w - 2, box_right + 40),
@@ -422,37 +494,39 @@ def _inspect_live_antigravity_bar(
         if send is not None:
             box_right = send[0] + SEND_LEFT_TO_BOX_RIGHT
 
-        # Now inspect the Send button relative to `box_right`!
-        # In Narrow, Default, Wide, and Fill, the circular Send button center is ALWAYS at `box_right - 26`, `y = screen_h - 97`.
+        # Inspect whether the Send disc is lit in the 3rd Accent color.
         x_btn = box_right - 26
         br, bg_c, bb = px(x_btn, y_btn)
         sat = max(br, bg_c, bb) - min(br, bg_c, bb)
+        is_send_accent = bool(send is not None and sat >= 45 and max(br, bg_c, bb) >= 80)
 
-        # When idle, the button is bright neutral Foreground white/grey (low saturation < 20).
-        # When active (typing or file attached), the circular Send button lights up in the 3rd Accent color (saturation >= 45).
-        is_send_accent = bool(sat >= 45 and max(br, bg_c, bb) >= 80)
-
-        # Locate the real left edge of the `Turbo` shield icon on the toolbar row so the pill
-        # hugs it in every Conversation Width mode (measured: Send 1300-1328, mic 1275-1283,
-        # chevron 1249-1252, Turbo 1208-1238, shield 1190 @ 1360x768, box_right ~1340).
+        # Locate the real left edge of the permanent `shield + Turbo` cluster on the toolbar row.
+        # When the input box is empty or in Voice Mode, the round `Send` disc is absent, so we start
+        # the leftward scan from `box_right - 14` (when Send is absent) or `send[0] - 8` (when Send is present),
+        # ensuring the permanent `shield + Turbo` cluster is ALWAYS captured in Narrow | Default | Wide | Fill.
         stop_x = max(int(round(screen_w * 0.3)), box_right - 420)
         if pill_right_x is not None and stop_x < pill_right_x < box_right:
             stop_x = pill_right_x  # never read our own pill's pixels
+        scan_start_x = (send[0] - 8) if send is not None else (box_right - 14)
         turbo_left = _find_toolbar_left_edge(
             px,
-            start_x=box_right - 46,
+            start_x=min(screen_w - 4, max(stop_x, scan_start_x)),
             stop_x=stop_x,
             rows=(y_btn, y_btn + 3, y_btn + 6),
             surface_rgb=(rm, gm, bm),
         )
-        # Plausibility window around the measured shield offset (box_right - 144). Rejects the
-        # self-occlusion trap: after Wide -> Default the pill still covers the shield + "Turb", the
-        # scan only sees "o" (~box_right - 104) and the pill would lock onto it, overlapping Turbo.
-        # Window allows a slightly shorter mode label (-15 px) or a longer one (+40 px).
+        # Plausibility window around the measured shield offset (box_right - 144). When Send is absent
+        # (empty bar or Voice Mode), the cluster can sit slightly closer to `box_right` (down to ~85 px)
+        # or `box_right` can be slightly wider; when `turbo_left` is valid, normalize `box_right` from
+        # the permanent `shield + Turbo` anchor so `box_right` never drifts when Send disappears.
         if turbo_left is not None:
             offset = box_right - turbo_left
-            if not (TURBO_SHIELD_OFFSET - 15 <= offset <= TURBO_SHIELD_OFFSET + 40):
+            min_offset = (TURBO_SHIELD_OFFSET - 15) if send is not None else (TURBO_SHIELD_OFFSET - 60)
+            max_offset = (TURBO_SHIELD_OFFSET + 40) if send is not None else (TURBO_SHIELD_OFFSET + 55)
+            if not (min_offset <= offset <= max_offset):
                 turbo_left = None
+            elif send is None:
+                box_right = turbo_left + TURBO_SHIELD_OFFSET
         _set_inspect_error(None)
         return (True, is_send_accent, box_right, bar_surface_hex, turbo_left)
     except Exception:
@@ -696,21 +770,32 @@ class StudioTokenPillHUD:
             pass
         return changed
 
-    def _compute_displayed_label(self) -> str:
+    def _compute_displayed_total_tokens(self) -> int:
         draft_toks = math.ceil(self._live_draft_chars / 3.8) + self._live_pasted_tokens
-        total = self._base_tokens + draft_toks
+        return self._base_tokens + draft_toks
+
+    def _compute_displayed_label(self) -> str:
+        total = self._compute_displayed_total_tokens()
         return f"{total:,} tokens"
 
     def _redraw_pill(self) -> None:
         """Render borderless native toolbar item matching `Turbo` and `+ Gemini 4 ...`:
         - No border (`encadré` removed completely so it never steals visual attention).
         - Background matches the `#202020` input-bar surface seamlessly.
-        - Indicator dot (`•`) is muted secondary grey (`#8E8E8E`) when idle and shifts to
-          the 3rd Accent color (`#8423BF`) when typing or attaching files.
-        - Token label (`286,659 tokens`) stays in calm secondary grey (`#8E8E8E`).
+        - Theme color #3 (`self.accent_color`) is strictly banned on the pill.
+        - Both the indicator dot (`•`) and the token label (`286,659 tokens`) share the exact
+          3-tier token threshold color:
+          * `< 300,000`        -> `#8E8E8E` (calm secondary grey)
+          * `300,000..449,999` -> `#F59E0B` (warning yellow/amber)
+          * `>= 450,000`       -> `#EF4444` (critical red)
         """
-        self._current_label = self._compute_displayed_label()
-        dot_color = self.accent_color if self._is_active_accent else "#8E8E8E"
+        total_tokens = self._compute_displayed_total_tokens()
+        self._current_label = f"{total_tokens:,} tokens"
+        tier_color = _resolve_pill_tier_color(
+            total_tokens,
+            is_active_accent=self._is_active_accent,
+            accent_color=self.accent_color,
+        )
         # Exact rendered width (old `len*7+20` estimate left ~25 px of empty canvas before Turbo).
         text_px = self._label_font.measure(self._current_label)
         self._pill_width = int(self.TEXT_X + text_px + self.TEXT_PAD_RIGHT)
@@ -720,13 +805,13 @@ class StudioTokenPillHUD:
 
         h = self.PILL_HEIGHT
         cy = h / 2.0
-        self.canvas.create_oval(4, cy - 3.5, 11, cy + 3.5, fill=dot_color, outline=dot_color)
+        self.canvas.create_oval(4, cy - 3.5, 11, cy + 3.5, fill=tier_color, outline=tier_color)
         self.canvas.create_text(
             self.TEXT_X,
             cy,
             text=self._current_label,
             anchor="w",
-            fill="#8E8E8E",
+            fill=tier_color,
             font=self._label_font,
         )
 
@@ -808,7 +893,7 @@ class StudioTokenPillHUD:
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         if self._detected_box_right is not None and not self._user_custom_dragged:
-            # Hug the Turbo shield in Narrow, Default, Wide and Fill alike.
+            # Anchor primarily to the left edge of the permanent `shield + Turbo` cluster in Narrow | Default | Wide | Fill.
             turbo_left = self._detected_turbo_left
             if turbo_left is not None:
                 # Learn the real shield offset so the fallback lands on the SAME spot (no 2-step jump).
@@ -816,7 +901,14 @@ class StudioTokenPillHUD:
             else:
                 offset = getattr(self, "_learned_turbo_offset", self.TURBO_FALLBACK_FROM_BOX_RIGHT)
                 turbo_left = self._detected_box_right - offset
-            x = max(20, turbo_left - self.GAP_BEFORE_TURBO - self._pill_width)
+            stable_turbo_left = _apply_anchor_hysteresis(
+                turbo_left,
+                getattr(self, "_stable_turbo_left", None),
+                ANCHOR_DEADZONE_PX,
+            )
+            self._stable_turbo_left = stable_turbo_left
+            anchor_left = stable_turbo_left if stable_turbo_left is not None else turbo_left
+            x = max(20, anchor_left - self.GAP_BEFORE_TURBO - self._pill_width)
         else:
             x = max(20, sw - self.dx_from_right)
         y = max(20, sh - self.dy_from_bottom)
@@ -897,10 +989,18 @@ class StudioTokenPillHUD:
             )
             if not bar_visible:
                 self._place_pill(visible=False)
-            else:
+            if bar_visible:
                 if box_right is not None:
-                    self._detected_box_right = box_right
-                    self._detected_turbo_left = turbo_left
+                    self._detected_box_right = _apply_anchor_hysteresis(
+                        box_right,
+                        self._detected_box_right,
+                        ANCHOR_DEADZONE_PX,
+                    )
+                    self._detected_turbo_left = _apply_anchor_hysteresis(
+                        turbo_left,
+                        self._detected_turbo_left,
+                        ANCHOR_DEADZONE_PX,
+                    )
                 surface_changed = bar_surface_hex != self._bar_surface_color
                 self._bar_surface_color = bar_surface_hex
                 has_draft = (
