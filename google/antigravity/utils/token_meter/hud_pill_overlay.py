@@ -32,7 +32,12 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from multimodal_token_meter import MultimodalTokenMeter, count_text_tokens  # noqa: E402
+from multimodal_token_meter import (  # noqa: E402
+    ACTIVE_STATE_MAX_AGE_MS,
+    MultimodalTokenMeter,
+    count_text_tokens,
+    resolve_active_conversation_id,
+)
 
 GWL_EXSTYLE = -20
 WS_EX_NOACTIVATE = 0x08000000
@@ -115,7 +120,45 @@ def _apply_anchor_hysteresis(
         return previous_x
     return candidate_x
 
+
+def _update_detected_anchors(
+    prev_box_right: int | None,
+    prev_turbo_left: int | None,
+    box_right: int | None,
+    turbo_left: int | None,
+    deadzone_px: int = ANCHOR_DEADZONE_PX,
+) -> tuple[int | None, int | None, bool]:
+    """Update `(detected_box_right, detected_turbo_left, turbo_cleared)` without shrink deadlock.
+
+    When `box_right` shifts (e.g. sidebar opens / width narrows from 1332 -> 1294) while `turbo_left`
+    is temporarily `None` (shield occluded by our own pill), clears stale `prev_turbo_left` so
+    `_place_pill` immediately tracks `box_right - learned_offset` and un-occludes the shield.
+    """
+    if box_right is None:
+        return (prev_box_right, prev_turbo_left, False)
+
+    next_box_right = _apply_anchor_hysteresis(box_right, prev_box_right, deadzone_px)
+    if turbo_left is not None:
+        next_turbo_left = _apply_anchor_hysteresis(turbo_left, prev_turbo_left, deadzone_px)
+        return (next_box_right, next_turbo_left, False)
+
+    box_shifted = (
+        prev_box_right is not None
+        and next_box_right is not None
+        and abs(next_box_right - prev_box_right) > deadzone_px
+    )
+    stale_out_of_range = False
+    if prev_turbo_left is not None and next_box_right is not None:
+        offset = next_box_right - prev_turbo_left
+        stale_out_of_range = not ((TURBO_SHIELD_OFFSET - 60) <= offset <= (TURBO_SHIELD_OFFSET + 55))
+
+    if box_shifted or stale_out_of_range:
+        return (next_box_right, None, True)
+    return (next_box_right, prev_turbo_left, False)
+
 _LAST_INSPECT_ERROR: str | None = None
+_LAST_TOOLBAR_RUNS: list[list[int]] = []
+_STORAGE_THEME_CACHE: tuple[float, int, int, tuple[str, str, str]] | None = None
 
 
 def _set_inspect_error(msg: str | None) -> None:
@@ -162,10 +205,15 @@ def _enable_dpi_awareness() -> None:
 
 
 def _read_storage_theme_colors() -> tuple[str, str, str]:
-    """Fetch user's configured theme colors from Antigravity's `app_storage.json`.
+    """Fetch user's configured theme colors from Antigravity's `app_storage.json` (cached).
     Uses muted secondary grey (`#8E8E8E`) matching `Turbo` and `Gemini 4 ...` so the pill
     never shines bright white or distracts the user's peripheral vision.
     """
+    global _STORAGE_THEME_CACHE
+    now_mono = time.monotonic()
+    if _STORAGE_THEME_CACHE is not None and (now_mono - _STORAGE_THEME_CACHE[0]) < 5.0:
+        return _STORAGE_THEME_CACHE[3]
+
     bg = "#101010"
     fg = "#8E8E8E"
     accent = "#8423BF"
@@ -174,22 +222,31 @@ def _read_storage_theme_colors() -> tuple[str, str, str]:
         / "Antigravity"
         / "app_storage.json"
     )
-    if storage_path.is_file():
-        try:
-            data = json.loads(storage_path.read_text(encoding="utf-8", errors="ignore"))
-            if isinstance(data.get("hubSurfaceBackgroundColor"), str) and data["hubSurfaceBackgroundColor"].startswith("#"):
-                bg = data["hubSurfaceBackgroundColor"]
-            for key in ("hubSurfaceForegroundColor", "hubForegroundColor", "foregroundColor"):
-                val = data.get(key)
-                if isinstance(val, str) and val.startswith("#"):
-                    fg = val
-            for key in ("hubAccentColor", "hubSurfaceAccentColor", "accentColor"):
-                val = data.get(key)
-                if isinstance(val, str) and val.startswith("#"):
-                    accent = val
-        except Exception:
-            pass
-    return (bg, fg, accent)
+    mtime_ns = 0
+    size = 0
+    try:
+        st = storage_path.stat()
+        mtime_ns = st.st_mtime_ns
+        size = st.st_size
+        if _STORAGE_THEME_CACHE is not None and _STORAGE_THEME_CACHE[1] == mtime_ns and _STORAGE_THEME_CACHE[2] == size:
+            _STORAGE_THEME_CACHE = (now_mono, mtime_ns, size, _STORAGE_THEME_CACHE[3])
+            return _STORAGE_THEME_CACHE[3]
+        data = json.loads(storage_path.read_text(encoding="utf-8", errors="ignore"))
+        if isinstance(data.get("hubSurfaceBackgroundColor"), str) and data["hubSurfaceBackgroundColor"].startswith("#"):
+            bg = data["hubSurfaceBackgroundColor"]
+        for key in ("hubSurfaceForegroundColor", "hubForegroundColor", "foregroundColor"):
+            val = data.get(key)
+            if isinstance(val, str) and val.startswith("#"):
+                fg = val
+        for key in ("hubAccentColor", "hubSurfaceAccentColor", "accentColor"):
+            val = data.get(key)
+            if isinstance(val, str) and val.startswith("#"):
+                accent = val
+    except Exception:
+        pass
+    colors = (bg, fg, accent)
+    _STORAGE_THEME_CACHE = (now_mono, mtime_ns, size, colors)
+    return colors
 
 
 def _rgb_from_colorref(color_ref: int) -> tuple[int, int, int]:
@@ -384,8 +441,8 @@ def _find_toolbar_left_edge(
     stop_x: int,
     rows: tuple[int, ...],
     surface_rgb: tuple[int, int, int],
-    max_gap: int = 30,
-    threshold: int = 24,
+    max_gap: int = 38,
+    threshold: int = 20,
 ) -> int | None:
     """Walk LEFT from `start_x` (just left of Send) across mic, chevron, `Turbo` and its shield icon.
 
@@ -505,25 +562,48 @@ def _inspect_live_antigravity_bar(
         # the leftward scan from `box_right - 14` (when Send is absent) or `send[0] - 8` (when Send is present),
         # ensuring the permanent `shield + Turbo` cluster is ALWAYS captured in Narrow | Default | Wide | Fill.
         stop_x = max(int(round(screen_w * 0.3)), box_right - 420)
+        clamped_by_pill = False
         if pill_right_x is not None and stop_x < pill_right_x < box_right:
             stop_x = pill_right_x  # never read our own pill's pixels
+            clamped_by_pill = True
         scan_start_x = (send[0] - 8) if send is not None else (box_right - 14)
+        toolbar_rows = (y_btn - 2, y_btn, y_btn + 3, y_btn + 6, y_btn + 8)
         turbo_left = _find_toolbar_left_edge(
             px,
             start_x=min(screen_w - 4, max(stop_x, scan_start_x)),
             stop_x=stop_x,
-            rows=(y_btn, y_btn + 3, y_btn + 6),
+            rows=toolbar_rows,
             surface_rgb=(rm, gm, bm),
         )
-        # Plausibility window around the measured shield offset (box_right - 144). When Send is absent
-        # (empty bar or Voice Mode), the cluster can sit slightly closer to `box_right` (down to ~85 px)
-        # or `box_right` can be slightly wider; when `turbo_left` is valid, normalize `box_right` from
-        # the permanent `shield + Turbo` anchor so `box_right` never drifts when Send disappears.
+        # Capture contiguous non-surface X runs in the right-side toolbar for diagnostic verification.
+        runs: list[list[int]] = []
+        run_lo = max(stop_x, box_right - 220)
+        run_hi = min(screen_w - 2, box_right)
+        for rx in range(run_lo, run_hi + 1):
+            hit = False
+            for ry in toolbar_rows:
+                rr, rg, rb = px(rx, ry)
+                if max(abs(rr - rm), abs(rg - gm), abs(rb - bm)) > 20:
+                    hit = True
+                    break
+            if hit:
+                if not runs or rx > runs[-1][1] + 2:
+                    runs.append([rx, rx])
+                else:
+                    runs[-1][1] = rx
+        global _LAST_TOOLBAR_RUNS
+        _LAST_TOOLBAR_RUNS = runs
+        # Plausibility window around the measured shield offset (box_right - 134..144; tighter policy
+        # labels / Stop buttons can sit down to ~89 px from box_right, while mic alone is ~55 px).
+        # If our own pill clamped `stop_x` right inside the cluster, clear `turbo_left` so the
+        # anchor updater slides the pill left and un-occludes the shield on the next tick.
         if turbo_left is not None:
             offset = box_right - turbo_left
-            min_offset = (TURBO_SHIELD_OFFSET - 15) if send is not None else (TURBO_SHIELD_OFFSET - 60)
-            max_offset = (TURBO_SHIELD_OFFSET + 40) if send is not None else (TURBO_SHIELD_OFFSET + 55)
-            if not (min_offset <= offset <= max_offset):
+            min_offset = (TURBO_SHIELD_OFFSET - 55) if send is not None else (TURBO_SHIELD_OFFSET - 60)
+            max_offset = (TURBO_SHIELD_OFFSET + 45) if send is not None else (TURBO_SHIELD_OFFSET + 55)
+            if (clamped_by_pill and turbo_left == stop_x and offset < (TURBO_SHIELD_OFFSET - 25)) or not (
+                min_offset <= offset <= max_offset
+            ):
                 turbo_left = None
             elif send is None:
                 box_right = turbo_left + TURBO_SHIELD_OFFSET
@@ -603,13 +683,18 @@ class StudioTokenPillHUD:
         self._last_typing_ts: float = 0.0
         self._last_upload_count: int = -1
         self._last_step_count: int = -1
+        self._last_conv_id: str | None = None
         self._live_draft_chars: int = 0
         self._live_pasted_tokens: int = 0
         self._prev_keys_down: set[int] = set()
         self._base_tokens: int = 0
         self._current_label: str = "0 tokens"
+        self._current_tier_color: str = PILL_COLOR_CALM_GREY
         self._is_active_accent: bool = False
         self._pill_width: int = 132
+        self._last_drawn_state: tuple[str, str, str] | None = None
+        self._shared_state_cache: tuple[int, int, str | None, int | float | None, list[str], str] | None = None
+        self._last_tick_tokens_ms: float = 0.0
 
         self.meter = MultimodalTokenMeter()
         self.root = tk.Tk()
@@ -707,16 +792,32 @@ class StudioTokenPillHUD:
             pass
 
     def _read_shared_state(self) -> tuple[str | None, list[str], str]:
-        if not self.state_file.is_file():
-            return (None, [], "")
+        raw_conv_id: str | None = None
+        updated_at_ms: int | float | None = None
+        extra: list[str] = []
+        sidecar_accent = ""
         try:
-            data: dict[str, Any] = json.loads(self.state_file.read_text(encoding="utf-8"))
-            conv_id = data.get("conversation_id") or None
-            extra = [str(p) for p in data.get("staged_files", []) if p]
-            sidecar_accent = str(data.get("accent_color") or "")
-            return (conv_id, extra, sidecar_accent)
+            st = self.state_file.stat()
+            sig_mtime_ns, sig_size = st.st_mtime_ns, st.st_size
+            cached = self._shared_state_cache
+            if cached is not None and cached[0] == sig_mtime_ns and cached[1] == sig_size:
+                raw_conv_id, updated_at_ms, extra, sidecar_accent = cached[2], cached[3], cached[4], cached[5]
+            else:
+                data: dict[str, Any] = json.loads(self.state_file.read_text(encoding="utf-8"))
+                raw_conv_id = data.get("conversation_id") or None
+                updated_at_ms = data.get("updated_at_ms")
+                extra = [str(p) for p in data.get("staged_files", []) if p]
+                sidecar_accent = str(data.get("accent_color") or "")
+                self._shared_state_cache = (sig_mtime_ns, sig_size, raw_conv_id, updated_at_ms, extra, sidecar_accent)
         except Exception:
-            return (None, [], "")
+            self._shared_state_cache = None
+
+        conv_id = self.meter.resolve_conversation_id(
+            raw_conv_id,
+            updated_at_ms,
+            max_age_ms=ACTIVE_STATE_MAX_AGE_MS,
+        )
+        return (conv_id, extra, sidecar_accent)
 
     def _poll_live_draft_keys(self) -> bool:
         """Poll key edges so typing or pasting in the bar increments token count in real time BEFORE Send."""
@@ -796,6 +897,11 @@ class StudioTokenPillHUD:
             is_active_accent=self._is_active_accent,
             accent_color=self.accent_color,
         )
+        self._current_tier_color = tier_color
+        draw_state = (self._current_label, tier_color, self._bar_surface_color)
+        if draw_state == getattr(self, "_last_drawn_state", None):
+            return
+        self._last_drawn_state = draw_state
         # Exact rendered width (old `len*7+20` estimate left ~25 px of empty canvas before Turbo).
         text_px = self._label_font.measure(self._current_label)
         self._pill_width = int(self.TEXT_X + text_px + self.TEXT_PAD_RIGHT)
@@ -943,6 +1049,7 @@ class StudioTokenPillHUD:
                 pass
 
     def _tick_tokens(self) -> None:
+        t0 = time.perf_counter()
         try:
             if self._script_path.is_file() and self._script_path.stat().st_mtime != self._script_mtime:
                 # Just exit: the sidecar's `watchFile` (main.mjs) respawns us. `os.execv` on Windows
@@ -958,6 +1065,13 @@ class StudioTokenPillHUD:
                 self.accent_color = acc
 
             bd = self.meter.get_breakdown(conversation_id=conv_id, extra_files=staged_files)
+            if self._last_conv_id is not None and bd.conversation_id != self._last_conv_id:
+                self._live_draft_chars = 0
+                self._live_pasted_tokens = 0
+                self._last_step_count = bd.step_count
+                self._last_upload_count = len(bd.attachments)
+            self._last_conv_id = bd.conversation_id
+
             if self._last_step_count >= 0 and bd.step_count > self._last_step_count:
                 self._live_draft_chars = 0
                 self._live_pasted_tokens = 0
@@ -973,6 +1087,7 @@ class StudioTokenPillHUD:
             self._redraw_pill()
         except Exception:
             pass
+        self._last_tick_tokens_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         self.root.after(450, self._tick_tokens)
 
     def _tick_visual_and_position(self) -> None:
@@ -991,16 +1106,15 @@ class StudioTokenPillHUD:
                 self._place_pill(visible=False)
             if bar_visible:
                 if box_right is not None:
-                    self._detected_box_right = _apply_anchor_hysteresis(
-                        box_right,
+                    self._detected_box_right, self._detected_turbo_left, turbo_cleared = _update_detected_anchors(
                         self._detected_box_right,
-                        ANCHOR_DEADZONE_PX,
-                    )
-                    self._detected_turbo_left = _apply_anchor_hysteresis(
-                        turbo_left,
                         self._detected_turbo_left,
+                        box_right,
+                        turbo_left,
                         ANCHOR_DEADZONE_PX,
                     )
+                    if turbo_cleared:
+                        self._stable_turbo_left = None
                 surface_changed = bar_surface_hex != self._bar_surface_color
                 self._bar_surface_color = bar_surface_hex
                 has_draft = (
@@ -1019,6 +1133,11 @@ class StudioTokenPillHUD:
                     surface=bar_surface_hex, pill_right_in=pill_right,
                     pill_x=self.root.winfo_x(), pill_w=self._pill_width,
                     dragged=self._user_custom_dragged, inspect_error=_LAST_INSPECT_ERROR,
+                    conversation_id=self._last_conv_id,
+                    total_tokens=self._compute_displayed_total_tokens(),
+                    pill_color=self._current_tier_color,
+                    tick_tokens_ms=self._last_tick_tokens_ms,
+                    toolbar_runs=_LAST_TOOLBAR_RUNS,
                 )
         except Exception:
             import traceback

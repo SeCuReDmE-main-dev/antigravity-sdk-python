@@ -147,7 +147,7 @@ if (typeof hudWatchdog.unref === 'function') {
   hudWatchdog.unref();
 }
 
-watchFile(join(here, 'hud_pill_overlay.py'), { interval: 1000 }, () => {
+function restartHudOnCodeChange() {
   if (hudProc) {
     try { hudProc.kill(); } catch {}
     hudProc = null;
@@ -155,7 +155,10 @@ watchFile(join(here, 'hud_pill_overlay.py'), { interval: 1000 }, () => {
   hudRetryCount = 0;
   hudNextAllowedSpawnAt = 0;
   ensureHudRunning(true);
-});
+}
+
+watchFile(join(here, 'hud_pill_overlay.py'), { interval: 1000 }, restartHudOnCodeChange);
+watchFile(join(here, 'multimodal_token_meter.py'), { interval: 1000 }, restartHudOnCodeChange);
 
 const app = new SidecarApp();
 
@@ -170,10 +173,13 @@ app.api(
 app.api('/api/tokens', (data) => {
   ensureHudRunning();
   const st = readState();
-  const convId = data.conversationId || st.conversation_id || '';
+  const nowMs = Date.now();
   let changed = false;
-  if (data.conversationId && data.conversationId !== st.conversation_id) {
-    st.conversation_id = data.conversationId;
+  let pushedConvId = '';
+  if (data.conversationId) {
+    pushedConvId = String(data.conversationId);
+    st.conversation_id = pushedConvId;
+    st.updated_at_ms = nowMs;
     changed = true;
   }
   if (data.accentColor && data.accentColor.startsWith('#') && data.accentColor !== st.accent_color) {
@@ -184,12 +190,15 @@ app.api('/api/tokens', (data) => {
     writeState(st);
   }
   const extraFiles = Array.isArray(data.stagedFiles) ? data.stagedFiles : (st.staged_files || []);
+  const stateConvId = pushedConvId || st.conversation_id || null;
+  const stateUpdatedAtMs = pushedConvId ? nowMs : (typeof st.updated_at_ms === 'number' ? st.updated_at_ms : null);
   const pyCode = [
     'import json, sys',
     `sys.path.insert(0, ${JSON.stringify(here)})`,
-    'from multimodal_token_meter import MultimodalTokenMeter',
+    'from multimodal_token_meter import MultimodalTokenMeter, resolve_active_conversation_id',
     'm = MultimodalTokenMeter()',
-    `bd = m.get_breakdown(conversation_id=${JSON.stringify(convId || null)}, extra_files=${JSON.stringify(extraFiles)}, draft_text=${JSON.stringify(data.draftText || '')})`,
+    `resolved_id = resolve_active_conversation_id(${JSON.stringify(stateConvId)}, ${JSON.stringify(stateUpdatedAtMs)}, brain_root=m.brain_root, annotations_root=m.annotations_root)`,
+    `bd = m.get_breakdown(conversation_id=resolved_id, extra_files=${JSON.stringify(extraFiles)}, draft_text=${JSON.stringify(data.draftText || '')})`,
     'print(json.dumps(bd.to_dict(), ensure_ascii=False))',
   ].join('; ');
   const out = execFileSync(pyBin, ['-c', pyCode], { encoding: 'utf8' });
